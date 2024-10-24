@@ -11,7 +11,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 	"github.com/alexflint/go-arg"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
+	"github.com/simongottschlag/go-federated-credentials-lab/internal/azkeyssigner"
 )
 
 func main() {
@@ -78,7 +81,7 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("failed to write OpenID config: %w", err)
 	}
 
-	jwk := struct {
+	publicJWK := struct {
 		Kty string `json:"kty"`
 		E   string `json:"e"`
 		N   string `json:"n"`
@@ -89,12 +92,12 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("failed to marshal key: %w", err)
 	}
 
-	err = json.Unmarshal(resJsonBytes, &jwk)
+	err = json.Unmarshal(resJsonBytes, &publicJWK)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal key: %w", err)
 	}
 
-	jwk.Kid = keyVersion
+	publicJWK.Kid = keyVersion
 
 	jwks := struct {
 		Keys []struct {
@@ -105,7 +108,7 @@ func run(ctx context.Context, cfg config) error {
 		} `json:"keys"`
 	}{}
 
-	jwks.Keys = append(jwks.Keys, jwk)
+	jwks.Keys = append(jwks.Keys, publicJWK)
 
 	jwksBytes, err := json.Marshal(jwks)
 	if err != nil {
@@ -118,28 +121,30 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	now := time.Now()
-	claims := jwt.MapClaims{
-		"iss": openidConfig.Issuer,
-		"sub": cfg.TokenSubject,
-		"aud": "api://AzureADTokenExchange",
-		"nbf": now.Unix(),
-		"iat": now.Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
-	}
-	token := jwt.NewWithClaims(signingMethodRS256, claims)
-	token.Header["kid"] = keyVersion
-
-	key, err := newKey(ctx, client, "jwt-encryption", keyVersion)
+	tok, err := jwt.NewBuilder().
+		Issuer(openidConfig.Issuer).
+		Subject(cfg.TokenSubject).
+		Audience([]string{"api://AzureADTokenExchange"}).
+		IssuedAt(now).
+		NotBefore(now).
+		Expiration(now.Add(5 * time.Minute)).
+		Build()
 	if err != nil {
-		return fmt.Errorf("failed to create a key: %w", err)
+		return fmt.Errorf("failed to build token: %w", err)
 	}
 
-	serialized, err := token.SignedString(key)
+	signer := azkeyssigner.New(ctx, client, cfg.KeyName, keyVersion)
+	jwsProtectedHeaders := jws.NewHeaders()
+	err = jwsProtectedHeaders.Set(jws.KeyIDKey, keyVersion)
+	if err != nil {
+		return fmt.Errorf("failed to set JWE protected header %q: %w", jws.KeyIDKey, err)
+	}
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), signer, jws.WithProtectedHeaders(jwsProtectedHeaders)))
 	if err != nil {
 		return fmt.Errorf("failed to sign token: %w", err)
 	}
 
-	fmt.Println(serialized)
+	fmt.Println(string(signed))
 
 	return nil
 }
