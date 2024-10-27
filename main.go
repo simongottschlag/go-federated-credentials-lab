@@ -48,16 +48,6 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("failed to create a client: %w", err)
 	}
 
-	res, err := client.GetKey(ctx, cfg.KeyName, "", nil)
-	if err != nil {
-		return fmt.Errorf("failed to get key: %w", err)
-	}
-
-	keyVersion := res.Key.KID.Version()
-	if keyVersion == "" {
-		return fmt.Errorf("missing key version")
-	}
-
 	openidConfig := struct {
 		JwksURI string `json:"jwks_uri"`
 		Issuer  string `json:"issuer"`
@@ -81,36 +71,13 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("failed to write OpenID config: %w", err)
 	}
 
-	publicJWK := struct {
-		Kty string `json:"kty"`
-		E   string `json:"e"`
-		N   string `json:"n"`
-		Kid string `json:"kid"`
-	}{}
-	resJsonBytes, err := res.Key.MarshalJSON()
+	signer := azkeyssigner.New(ctx, client, cfg.KeyName)
+	jwkSet, err := signer.GetPublicJWKSet(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to marshal key: %w", err)
+		return fmt.Errorf("failed to get public JWK set: %w", err)
 	}
 
-	err = json.Unmarshal(resJsonBytes, &publicJWK)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal key: %w", err)
-	}
-
-	publicJWK.Kid = keyVersion
-
-	jwks := struct {
-		Keys []struct {
-			Kty string `json:"kty"`
-			E   string `json:"e"`
-			N   string `json:"n"`
-			Kid string `json:"kid"`
-		} `json:"keys"`
-	}{}
-
-	jwks.Keys = append(jwks.Keys, publicJWK)
-
-	jwksBytes, err := json.Marshal(jwks)
+	jwksBytes, err := json.Marshal(jwkSet)
 	if err != nil {
 		return fmt.Errorf("failed to marshal JWKS: %w", err)
 	}
@@ -133,8 +100,11 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("failed to build token: %w", err)
 	}
 
-	signer := azkeyssigner.New(ctx, client, cfg.KeyName, keyVersion)
 	jwsProtectedHeaders := jws.NewHeaders()
+	keyVersion, err := signer.GetLatestKeyID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get latest used key version: %w", err)
+	}
 	err = jwsProtectedHeaders.Set(jws.KeyIDKey, keyVersion)
 	if err != nil {
 		return fmt.Errorf("failed to set JWE protected header %q: %w", jws.KeyIDKey, err)

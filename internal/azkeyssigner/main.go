@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
@@ -13,20 +14,20 @@ import (
 )
 
 type Signer struct {
-	ctx        context.Context
-	client     *azkeys.Client
-	keyName    string
-	keyVersion string
+	ctx     context.Context
+	client  *azkeys.Client
+	keyName string
 }
 
 var _ crypto.Signer = (*Signer)(nil)
 
-func New(ctx context.Context, client *azkeys.Client, keyName string, keyVersion string) *Signer {
+const useLatestKeyVersion = ""
+
+func New(ctx context.Context, client *azkeys.Client, keyName string) *Signer {
 	return &Signer{
-		ctx:        ctx,
-		client:     client,
-		keyName:    keyName,
-		keyVersion: keyVersion,
+		ctx:     ctx,
+		client:  client,
+		keyName: keyName,
 	}
 }
 
@@ -39,7 +40,7 @@ func (s *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byt
 	signResponse, err := s.client.Sign(
 		s.ctx,
 		s.keyName,
-		s.keyVersion,
+		useLatestKeyVersion,
 		azkeys.SignParameters{
 			Algorithm: signatureAlgorithm,
 			Value:     digest,
@@ -53,10 +54,6 @@ func (s *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byt
 		return nil, fmt.Errorf("signed response missing KID")
 	}
 
-	if signResponse.KID.Version() != s.keyVersion {
-		return nil, fmt.Errorf("unexpected key version in the response %s (expected: %s)", signResponse.KID.Version(), s.keyVersion)
-	}
-
 	if signResponse.Result == nil {
 		return nil, fmt.Errorf("missing signature result")
 	}
@@ -65,12 +62,12 @@ func (s *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byt
 }
 
 func (s *Signer) Public() crypto.PublicKey {
-	keyResponse, err := s.client.GetKey(s.ctx, s.keyName, s.keyVersion, &azkeys.GetKeyOptions{})
+	keyResponse, err := s.client.GetKey(s.ctx, s.keyName, useLatestKeyVersion, &azkeys.GetKeyOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get key: %w", err)
 	}
 
-	jwk, err := getJWKfromKeyResponse(keyResponse)
+	jwk, err := getPublicJWKfromKeyResponse(keyResponse)
 	if err != nil {
 		return fmt.Errorf("failed to get JWK from key response: %w", err)
 	}
@@ -83,6 +80,75 @@ func (s *Signer) Public() crypto.PublicKey {
 	return rsaPublicKey
 }
 
+func (s *Signer) GetPublicJWKSet(ctx context.Context) (jwk.Set, error) {
+	listKeyPropertiesVersionPager := s.client.NewListKeyPropertiesVersionsPager(s.keyName, &azkeys.ListKeyPropertiesVersionsOptions{})
+
+	keyVersions := []string{}
+	for listKeyPropertiesVersionPager.More() {
+		res, err := listKeyPropertiesVersionPager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get key properties versions: %w", err)
+		}
+
+		for _, key := range res.Value {
+			if key == nil ||
+				key.Attributes == nil ||
+				key.Attributes.Expires == nil ||
+				key.Attributes.Enabled == nil {
+				continue
+			}
+
+			if time.Now().After(*key.Attributes.Expires) {
+				continue
+			}
+
+			if !*key.Attributes.Enabled {
+				continue
+			}
+
+			keyVersions = append(keyVersions, key.KID.Version())
+		}
+	}
+
+	if len(keyVersions) == 0 {
+		return nil, fmt.Errorf("no enabled key versions found")
+	}
+
+	jwkSet := jwk.NewSet()
+	for _, keyVersion := range keyVersions {
+		keyResponse, err := s.client.GetKey(s.ctx, s.keyName, keyVersion, &azkeys.GetKeyOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get key: %w", err)
+		}
+
+		pubKey, err := getPublicJWKfromKeyResponse(keyResponse)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get JWK from key response: %w", err)
+		}
+
+		jwkSet.AddKey(pubKey)
+	}
+
+	return jwkSet, nil
+}
+
+func (s *Signer) GetLatestKeyID(ctx context.Context) (string, error) {
+	res, err := s.client.GetKey(s.ctx, s.keyName, useLatestKeyVersion, &azkeys.GetKeyOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get key: %w", err)
+	}
+
+	if res.Key.KID == nil {
+		return "", fmt.Errorf("key missing KID")
+	}
+
+	if res.Key.KID.Version() == "" {
+		return "", fmt.Errorf("key version missing")
+	}
+
+	return res.Key.KID.Version(), nil
+}
+
 func (s *Signer) getSignatureAlgorithm(opts crypto.SignerOpts) (*azkeys.SignatureAlgorithm, error) {
 	switch opts {
 	case crypto.SHA256:
@@ -91,7 +157,7 @@ func (s *Signer) getSignatureAlgorithm(opts crypto.SignerOpts) (*azkeys.Signatur
 	return nil, fmt.Errorf("unsupported signature algorithm: %s", opts)
 }
 
-func getJWKfromKeyResponse(keyResponse azkeys.GetKeyResponse) (jwk.Key, error) {
+func getPublicJWKfromKeyResponse(keyResponse azkeys.GetKeyResponse) (jwk.Key, error) {
 	jsonKeyBytes, err := keyResponse.Key.MarshalJSON()
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal key: %w", err)
@@ -102,7 +168,22 @@ func getJWKfromKeyResponse(keyResponse azkeys.GetKeyResponse) (jwk.Key, error) {
 		return nil, fmt.Errorf("failed to parse key: %w", err)
 	}
 
-	return parsedJwk, nil
+	pubKey, err := parsedJwk.PublicKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public key from JWK: %w", err)
+	}
+
+	err = pubKey.Set(jwk.KeyIDKey, keyResponse.Key.KID.Version())
+	if err != nil {
+		return nil, fmt.Errorf("failed to set key ID: %w", err)
+	}
+
+	err = pubKey.Remove(jwk.KeyOpsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to remove key operations: %w", err)
+	}
+
+	return pubKey, nil
 }
 
 func getRSAPublicKeyfromJWK(key jwk.Key) (*rsa.PublicKey, error) {
